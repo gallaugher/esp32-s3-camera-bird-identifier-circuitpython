@@ -1,0 +1,17 @@
+# Rename this file to  .gitignore  in the repo root.
+
+# Secrets - Wi-Fi password and Anthropic API key live here. Never commit.
+settings.toml
+
+# Local key file some people use for birdcam_helper.py
+anthropic_key.txt
+
+# macOS / editor litter
+.DS_Store
+._*
+.vscode/
+__pycache__/
+*.pyc
+
+# Photos saved by photo_test.py if you copy the CIRCUITPY drive
+photos/

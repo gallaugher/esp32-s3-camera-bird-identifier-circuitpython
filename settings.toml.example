@@ -1,0 +1,13 @@
+# Copy this file to the CIRCUITPY drive as  settings.toml  and fill in the values.
+# NEVER commit the real settings.toml - it holds your Wi-Fi password and API key.
+
+# Wi-Fi: a WPA2-Personal network (home router, phone hotspot). Enterprise/802.1X
+# networks such as eduroam are not supported by CircuitPython.
+CIRCUITPY_WIFI_SSID = "YourNetworkName"
+CIRCUITPY_WIFI_PASSWORD = "YourNetworkPassword"
+
+# Claude API - from platform.claude.com -> API keys. Needed on the board only for
+# AI_MODE = "direct". In helper mode, birdcam_helper.py on the Mac reads the key
+# from this file over USB, so the board itself never uses it.
+ANTHROPIC_API_KEY = "sk-ant-..."
+ANTHROPIC_MODEL = "claude-haiku-4-5"
