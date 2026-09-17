@@ -9,10 +9,11 @@ networks that block the board's HTTPS (BostonCollege). The board must be
 running cam_radar_ai.py with AI_MODE = "helper".
 
 Usage (Terminal, from the folder containing this file):
-    python3 birdcam_helper.py                     <- finds the board by itself (reads its IP
-                                                     over the USB serial port; close VS Code's
-                                                     Serial Monitor first, or pass the IP)
-    python3 birdcam_helper.py 10.20.76.118        <- the board's IP from its console
+    python3 birdcam_helper.py                 <- finds the board by itself: listens for the board's
+                                                 network beacon, then tries last time's address,
+                                                 birdcam.local, and the USB serial console
+    python3 birdcam_helper.py --scan          <- ... and if all else fails, probes the whole subnet
+    python3 birdcam_helper.py 10.20.76.118    <- or just give it the IP from the board's console
 
 API key: read from ANTHROPIC_API_KEY in the environment, else from the board's
 own /Volumes/CIRCUITPY/settings.toml, else from a settings.toml next to this file.
@@ -25,6 +26,7 @@ import json
 import os
 import select
 import re
+import socket
 import ssl
 import subprocess
 import sys
@@ -34,7 +36,7 @@ import tty
 import urllib.error
 import urllib.request
 
-BOARD = sys.argv[1] if len(sys.argv) > 1 else None   # None = find the board automatically
+BOARD = next((a for a in sys.argv[1:] if not a.startswith("--")), None)   # None = find the board automatically
 POLL_S = 0.7            # how often to ask the board for status
 SPEAK = False           # True: the Mac reads each answer aloud (macOS "say")
 MAX_TOKENS = 120
@@ -142,6 +144,8 @@ else:
 # ---- find the board ----------------------------------------------------------
 IP_CACHE = os.path.expanduser("~/.birdcam_ip")
 IP_RE = re.compile(rb"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})")
+BEACON_PORT = 47777          # must match BEACON_PORT in cam_radar_ai.py
+SCAN = "--scan" in sys.argv  # last resort: probe every address on the Mac's subnet
 
 
 def board_status(host, timeout=3):
@@ -153,19 +157,33 @@ def board_status(host, timeout=3):
         return None
 
 
+def ip_from_beacon(wait_s=4):
+    """The board broadcasts 'BIRDCAM <ip> <mac> <name>' over UDP every 2 s. Listen for one."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", BEACON_PORT))
+        sock.settimeout(wait_s)
+        data, addr = sock.recvfrom(256)
+        sock.close()
+        if data.startswith(b"BIRDCAM"):
+            return addr[0]
+    except Exception:  # pylint: disable=broad-except
+        pass
+    return None
+
+
 def ip_from_serial(wait_s=12):
     """Read the board's IP from its USB serial console (the board prints it every few seconds).
     If the board is silent for a while, send Ctrl-D so it reboots and prints its Wi-Fi line."""
     ports = glob.glob("/dev/cu.usbmodem*")
     if not ports:
-        print("  no USB serial port found (is the board plugged in?)")
         return None
     for port in ports:
         try:
             fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         except OSError as e:
-            print("  %s is busy (%s) - close VS Code's Serial Monitor, or pass the IP on the command line"
-                  % (port, e.strerror))
+            print("\n  %s is busy (%s) - a serial monitor has it open" % (port, e.strerror), end=" ")
             continue
         try:
             tty.setraw(fd)
@@ -195,40 +213,111 @@ def ip_from_serial(wait_s=12):
     return None
 
 
-candidates = []
-if BOARD:
-    candidates.append((BOARD, "command line"))
-else:
-    print("Finding the board over USB serial ...", end=" ", flush=True)
-    ip = ip_from_serial()
-    print(ip or "no luck")
-    if ip:
-        candidates.append((ip, "serial console"))
-    candidates.append(("birdcam.local", "mDNS"))
+def mac_subnet():
+    """(own ip, netmask) of the Mac's active interface, via a UDP socket trick + ipconfig."""
     try:
-        candidates.append((open(IP_CACHE).read().strip(), "last time"))
-    except OSError:
-        pass
-
-st = None
-for host, how in candidates:
-    print("Trying the board at http://%s (%s) ..." % (host, how), end=" ", flush=True)
-    st = board_status(host, timeout=4)
-    if st:
-        BOARD = host
-        print("OK - photo #%d so far, radar %s" % (st["count"], "ARMED" if st["armed"] else "disarmed"))
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("10.255.255.255", 1))
+        my_ip = probe.getsockname()[0]
+        probe.close()
+    except Exception:  # pylint: disable=broad-except
+        return None, None
+    mask = "255.255.255.0"
+    for iface in ("en0", "en1", "en2"):
         try:
-            open(IP_CACHE, "w").write(BOARD)
+            out = subprocess.run(["ipconfig", "getifaddr", iface], capture_output=True, text=True, check=False).stdout.strip()
+            if out == my_ip:
+                m = subprocess.run(["ipconfig", "getoption", iface, "subnet_mask"], capture_output=True, text=True, check=False).stdout.strip()
+                if m:
+                    mask = m
+                break
         except OSError:
-            pass
-        break
-    print("no answer")
-if not st:
-    sys.exit("\nCannot reach the board. Make sure the Mac is on the same Wi-Fi network as the board\n"
-             "(BostonCollege, not eduroam), then either close VS Code's Serial Monitor and rerun\n"
-             "  python3 birdcam_helper.py\nor read the IP from the board's console and run\n"
-             "  python3 birdcam_helper.py 10.20.xx.xx")
+            break
+    return my_ip, mask
 
+
+def ip_from_scan():
+    """Probe every host on the Mac's subnet (capped at 1024 addresses) for a bird-cam /status page."""
+    import concurrent.futures
+    my_ip, mask = mac_subnet()
+    if not my_ip:
+        return None
+    ip_i = sum(int(o) << (8 * (3 - i)) for i, o in enumerate(my_ip.split(".")))
+    m_i = sum(int(o) << (8 * (3 - i)) for i, o in enumerate(mask.split(".")))
+    if (0xFFFFFFFF ^ m_i) > 1023:                       # bigger than /22: just do our own /24
+        m_i = 0xFFFFFF00
+    base = ip_i & m_i
+    hosts = [".".join(str((base + n) >> (8 * k) & 0xFF) for k in (3, 2, 1, 0))
+             for n in range(1, (0xFFFFFFFF ^ m_i))]
+    print("\n  scanning %d addresses around %s ..." % (len(hosts), my_ip), end=" ", flush=True)
+
+    def probe(h):
+        try:
+            sock = socket.create_connection((h, 80), timeout=0.4)
+            sock.close()
+        except OSError:
+            return None
+        return h if board_status(h, timeout=2) else None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=96) as ex:
+        for hit in ex.map(probe, hosts):
+            if hit:
+                return hit
+    return None
+
+
+def load_cache():
+    try:
+        c = json.loads(open(IP_CACHE).read())
+        return c if isinstance(c, dict) else {"ip": str(c)}
+    except Exception:  # pylint: disable=broad-except
+        try:
+            return {"ip": open(IP_CACHE).read().strip()}
+        except OSError:
+            return {}
+
+
+cache = load_cache()
+st = None
+BOARD_FOUND_BY = None
+
+if BOARD:
+    print("Trying the board at http://%s (command line) ..." % BOARD, end=" ", flush=True)
+    st = board_status(BOARD, timeout=4)
+    print("OK" if st else "no answer")
+else:
+    steps = [
+        ("beacon",   "listening for the board's beacon on the network", lambda: ip_from_beacon(4)),
+        ("last time", "trying the address from last time",             lambda: cache.get("ip")),
+        ("mDNS",     "trying birdcam.local",                            lambda: "birdcam.local"),
+        ("serial",   "reading the USB serial console",                  lambda: ip_from_serial(10)),
+    ]
+    if SCAN:
+        steps.append(("scan", "scanning the Mac's subnet (--scan)", ip_from_scan))
+    for how, msg, fn in steps:
+        print("%s ..." % msg, end=" ", flush=True)
+        host = fn()
+        if host:
+            st = board_status(host, timeout=4)
+        if st:
+            BOARD, BOARD_FOUND_BY = host, how
+            print("found at http://%s" % host)
+            break
+        print("no")
+
+if not st:
+    sys.exit("\nCannot reach the board. Check that the Mac is on the same Wi-Fi network as the board\n"
+             "(BostonCollege, not eduroam). Then try, in order:\n"
+             "  python3 birdcam_helper.py --scan          (probes every address on this subnet)\n"
+             "  python3 birdcam_helper.py 10.20.xx.xx     (the IP from the board's console lines)\n"
+             "  or plug the board into this Mac by USB, close any serial monitor, and rerun.")
+
+print("Board: photo #%d so far, radar %s%s" % (st["count"], "ARMED" if st["armed"] else "disarmed",
+                                              (", MAC " + st["mac"]) if st.get("mac") else ""))
+try:
+    open(IP_CACHE, "w").write(json.dumps({"ip": BOARD, "mac": st.get("mac", "")}))
+except OSError:
+    pass
 if "ai_pending" not in st:
     print("  NOTE: the board is running an older code.py - copy the new cam_radar_ai.py to code.py "
           "(AI_MODE = \"helper\") and Ctrl-D, or nothing will be identified.")

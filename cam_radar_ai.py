@@ -52,6 +52,7 @@ FRAME_SIZE = espcamera.FrameSize.SVGA
 JPEG_QUALITY = 10
 FLIP_180 = False
 HOSTNAME = "birdcam"
+BEACON_PORT = 47777         # UDP "here I am" broadcast every 2 s so birdcam_helper.py can find this board
 
 TRIGGER_ENERGY = 60           # moving-target energy 0-100 needed to fire (hand wave ~50-100); 60 = deliberate waves only
 MIN_CM, MAX_CM = 0, 300       # only fire for moving targets in this distance window
@@ -300,7 +301,7 @@ def status_dict():
             "mov_cm": radar["mov_cm"], "mov_e": radar["mov_e"],
             "sta_cm": radar["sta_cm"], "sta_e": radar["sta_e"],
             "out": radar["out"], "frames": radar["frames"], "uart": uart_alive(), "ai": last_ai,
-            "ai_pending": ai_pending,
+            "ai_pending": ai_pending, "mac": MAC, "ip": ip,
             "since": int(time.monotonic() - last_shot) if photo_count else -1}
 
 
@@ -332,6 +333,36 @@ setInterval(function(){fetch('/status').then(r=>r.json()).then(show).catch(funct
 
 pool = socketpool.SocketPool(wifi.radio)
 server = Server(pool, debug=False)
+
+# ---- discovery beacon -----------------------------------------------------
+# Broadcast "BIRDCAM <ip>" on the local subnet every 2 s. birdcam_helper.py listens for it,
+# so the board can be found without a USB cable even after its DHCP address changes.
+MAC = ":".join("%02X" % b for b in wifi.radio.mac_address)
+try:
+    _ip_parts = [int(x) for x in ip.split(".")]
+    _mask_parts = [int(x) for x in str(wifi.radio.ipv4_subnet).split(".")]
+    broadcast_ip = ".".join(str(a | (~m & 0xFF)) for a, m in zip(_ip_parts, _mask_parts))
+except Exception:  # pylint: disable=broad-except
+    broadcast_ip = "255.255.255.255"
+beacon_sock = None
+beacon_msg = ("BIRDCAM %s %s %s" % (ip, MAC, HOSTNAME)).encode()
+last_beacon = -10.0
+
+
+def send_beacon():
+    global beacon_sock, last_beacon
+    last_beacon = time.monotonic()
+    try:
+        if beacon_sock is None:
+            beacon_sock = pool.socket(pool.AF_INET, pool.SOCK_DGRAM)
+            try:   # lwIP wants SO_BROADCAST before sending to a broadcast address
+                beacon_sock.setsockopt(getattr(pool, "SOL_SOCKET", 0xFFF), getattr(pool, "SO_BROADCAST", 0x20), 1)
+            except Exception:  # pylint: disable=broad-except
+                pass
+            beacon_sock.settimeout(0)
+        beacon_sock.sendto(beacon_msg, (broadcast_ip, BEACON_PORT))
+    except Exception:  # pylint: disable=broad-except
+        beacon_sock = None        # try to recreate next time; beacon is best-effort
 
 
 @server.route("/", GET)
@@ -438,6 +469,9 @@ while True:
         take_photo("BOOT button")
         time.sleep(0.2)
     was_pressed = pressed
+
+    if now - last_beacon >= 2:
+        send_beacon()
 
     # console heartbeat every 3 s - starts with the board's IP so it is always on screen
     if now - last_radar_print >= 3:
